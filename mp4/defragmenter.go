@@ -36,6 +36,17 @@ import (
 // Full-sample encryption with a constant IV has no such auxiliary data and
 // passes through losslessly, keeping the sinf of the sample description.
 //
+// The sample groups of the input are merged: the descriptions of the track's
+// sample table and of every track fragment are collected per grouping type,
+// identical descriptions are written once, and the samples that survive point
+// at their description through one sample-to-group box per grouping type and
+// grouping_type_parameter. Pre-roll and random-access recovery points ('roll'
+// and 'rap ') are carried this way like any other grouping type. A
+// description that no surviving sample refers to, such as one of a superseded
+// fragment, is not written. Samples with leading, dependency or redundancy
+// information keep it in an sdtp box; input without such information gets no
+// sdtp box.
+//
 // The ftyp is made for the output: major brand mp42 and the lowest brand of
 // ISO/IEC 14496-12 Annex E that the rebuilt moov needs, plus the codec brands
 // and the ISO/IEC 14496-15 track brands of the input. Input brands of the
@@ -68,6 +79,7 @@ type defragSample struct {
 	size    uint32
 	cts     int32
 	nonSync bool
+	dep     defragSampleDep // leading and dependency flags, from sdtp or trun sample flags
 }
 
 type defragRange struct {
@@ -112,6 +124,18 @@ type defragTrack struct {
 	frags        []*defragFragRec // one record per collected traf, plus the progressive part
 	live         []*defragFragRec // the records with kept > 0, in collection order
 	extendedDurs []paddedDur      // durations before gap padding, by increasing sample index
+	// Sample group state. groups holds one sample-to-group mapping per grouping
+	// type and grouping_type_parameter, and groupDescs the merged description
+	// list per grouping type, in creation order. trackGroupIdx maps the entries
+	// of the stbl description boxes to their merged indices, so that fragments
+	// can refer to them.
+	groups           []*defragGroup
+	groupsByKey      map[defragGroupKey]*defragGroup
+	groupDescs       []*defragGroupDescriptions
+	groupDescsByType map[string]*defragGroupDescriptions
+	trackGroupIdx    map[string][]uint32
+	trackDefaults    []trackDefault // default descriptions of the track's version 2 sgpd boxes
+	sawSdtp          bool           // the input had an sdtp box, so the output keeps one
 }
 
 // paddedDur remembers a sample's duration before a tfdt gap padded it.
@@ -300,6 +324,9 @@ func progressiveChunks(track *defragTrack, fileSize uint64) ([]*defragChunk, err
 	if stbl == nil {
 		return nil, nil
 	}
+	if err := track.collectTrackDescriptions(stbl); err != nil {
+		return nil, err
+	}
 	if stbl.Stsz == nil || stbl.Stsz.GetNrSamples() == 0 {
 		// stsz carries the only sample count mp4ff reads, so chunks declared
 		// without it would be dropped silently.
@@ -366,6 +393,9 @@ func progressiveChunks(track *defragTrack, fileSize uint64) ([]*defragChunk, err
 		track.endDts += uint64(durs[i])
 	}
 	track.started = true
+	if err := track.collectProgressiveGroups(stbl); err != nil {
+		return nil, err
+	}
 
 	var chunkOffsets []uint64
 	if stbl.Stco != nil {
@@ -633,6 +663,7 @@ func (d *defragmenter) collectTraf(moof *MoofBox, traf *TrafBox, track *defragTr
 		}
 	}
 	chunk := &defragChunk{track: track, sdi: sdi}
+	firstSample := len(track.samples)
 	next := baseOffset
 	for _, trun := range traf.Truns {
 		trun.AddSampleDefaultValues(tfhd, track.trex)
@@ -659,6 +690,7 @@ func (d *defragmenter) collectTraf(moof *MoofBox, traf *TrafBox, track *defragTr
 				size:    s.Size,
 				cts:     s.CompositionTimeOffset,
 				nonSync: nonSync,
+				dep:     sampleDepFromFlags(s.Flags),
 			})
 			track.endDts += uint64(s.Dur)
 			runSize += uint64(s.Size)
@@ -675,6 +707,9 @@ func (d *defragmenter) collectTraf(moof *MoofBox, traf *TrafBox, track *defragTr
 	if chunk.nrSamples > 0 {
 		track.chunks = append(track.chunks, chunk)
 		d.chunks = append(d.chunks, chunk)
+	}
+	if err := track.collectFragmentGroups(traf, firstSample, int(chunk.nrSamples)); err != nil {
+		return err
 	}
 	rec.end = track.endDts
 	rec.total = int(chunk.nrSamples)
@@ -744,6 +779,7 @@ func (d *defragmenter) dropTrackSamplesFrom(track *defragTrack, cutTime uint64) 
 			}
 		}
 		track.samples = track.samples[:keep]
+		track.trimGroups(keep)
 	}
 	track.endDts = cutTime
 	return nil
@@ -1118,6 +1154,10 @@ func fillSampleTables(track *defragTrack) error {
 	stsz := buildStsz(track.samples)
 	stss := buildStss(track.samples)
 	stco := &StcoBox{ChunkOffset: make([]uint32, len(track.chunks))}
+	sdtp, sbgps, sgpds, err := track.buildSampleGroups()
+	if err != nil {
+		return err
+	}
 
 	stbl.Stts = stts
 	stbl.Ctts = ctts
@@ -1126,9 +1166,21 @@ func fillSampleTables(track *defragTrack) error {
 	stbl.Stss = stss
 	stbl.Stco = stco
 	stbl.Co64 = nil
-	stbl.Sdtp = nil
+	stbl.Sdtp = sdtp
 	stbl.Sbgp, stbl.Sbgps = nil, nil
+	for _, sbgp := range sbgps {
+		if stbl.Sbgp == nil {
+			stbl.Sbgp = sbgp
+		}
+		stbl.Sbgps = append(stbl.Sbgps, sbgp)
+	}
 	stbl.Sgpd, stbl.Sgpds = nil, nil
+	for _, sgpd := range sgpds {
+		if stbl.Sgpd == nil {
+			stbl.Sgpd = sgpd
+		}
+		stbl.Sgpds = append(stbl.Sgpds, sgpd)
+	}
 	stbl.Subs = nil
 	stbl.Saio = nil
 	stbl.Saiz = nil
@@ -1141,6 +1193,15 @@ func fillSampleTables(track *defragTrack) error {
 		children = append(children, stss)
 	}
 	children = append(children, stco)
+	if sdtp != nil {
+		children = append(children, sdtp)
+	}
+	for _, sbgp := range sbgps {
+		children = append(children, sbgp)
+	}
+	for _, sgpd := range sgpds {
+		children = append(children, sgpd)
+	}
 	stbl.Children = children
 	return nil
 }
